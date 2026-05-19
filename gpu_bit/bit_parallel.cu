@@ -1,74 +1,103 @@
 // gpu_bit/bit_parallel.cu
+// Compile:
+//   nvcc -O2 -o bit_parallel bit_parallel.cu \
+//        -I./CGBN/include                    \
+//        -Xlinker -lgmp
 //
-// Approach C: Bit-Parallel Modular Exponentiation
-//
-// Phase 1 (parallel): one CGBN instance per bit of the exponent.
-//   Instance i computes base^(2^i) mod n by squaring base i times.
-//   All instances run fully independently -- no communication.
-//
-// Phase 2 (combine): one CGBN instance per task.
-//   Multiplies together the Phase 1 results where the corresponding
-//   exponent bit is 1.
+// Usage:
+//   ./bit_parallel input_file [output_file]
+// Example:
+//   ./bit_parallel ../data/dataset_1024bit.txt
+//   ./bit_parallel ../data/dataset_1024bit.txt ../data/out/bitpar_results.txt
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <vector>
 #include <cuda_runtime.h>
+#include <gmp.h>
 #include "cgbn/cgbn.h"
 
-typedef unsigned long long ull;
-
-#define BITS  1024   // supports up to 512-bit inputs (1024-bit intermediates)
-#define TPI   32
-#define TPB   128    // must be multiple of TPI
-#define EBITS 64     // exponent bit width -- raise to 512 for larger datasets
+#define BITS   1024
+#define TPI    32
+#define TPB    128
+#define LIMBS  (BITS/32)
+#define MAX_EBITS 1024   // hard cap
 
 typedef cgbn_context_t<TPI>         context_t;
-typedef cgbn_env_t<context_t, BITS> env_t;
+typedef cgbn_env_t<context_t,BITS>  env_t;
 typedef cgbn_mem_t<BITS>            mem_t;
 
-#define CUDA_CHECK(x)                                          \
-do {                                                           \
-    cudaError_t err = (x);                                     \
-    if(err != cudaSuccess){                                    \
-        printf("CUDA Error %s:%d : %s\n",                      \
-            __FILE__, __LINE__, cudaGetErrorString(err));      \
-        exit(1);                                               \
-    }                                                          \
-} while(0)
+#define CUDA_CHECK(x)                                      \
+do{                                                        \
+    cudaError_t err=(x);                                   \
+    if(err!=cudaSuccess){                                  \
+        printf("CUDA Error %s:%d\n%s\n",                   \
+        __FILE__,__LINE__,cudaGetErrorString(err));        \
+        exit(EXIT_FAILURE);                                \
+    }                                                      \
+}while(0)
 
-
-struct Task {
+struct Task{
     mem_t base;
     mem_t exp;
     mem_t mod;
 };
 
 
-static void store64(mem_t *m, ull val) {
+// ---------------------------------------------------------------------------
+// mpz -> mem
+// ---------------------------------------------------------------------------
+static void mpz_to_mem(mem_t *m, const mpz_t z){
     memset(m, 0, sizeof(mem_t));
-    m->_limbs[0] = (uint32_t)(val & 0xFFFFFFFF);
-    m->_limbs[1] = (uint32_t)(val >> 32);
+
+    uint8_t buf[BITS/8] = {0};
+    size_t count = 0;
+
+    mpz_export(buf, &count, -1, 1, -1, 0, z);
+
+    for(int i = 0; i < LIMBS; i++){
+        uint32_t limb = 0;
+        for(int b = 0; b < 4; b++){
+            size_t idx = (size_t)i*4 + b;
+            if(idx < count)
+                limb |= ((uint32_t)buf[idx]) << (8*b);
+        }
+        m->_limbs[i] = limb;
+    }
 }
 
 
-static ull load64(const mem_t *m) {
-    return (ull)m->_limbs[0] | ((ull)m->_limbs[1] << 32);
+// ---------------------------------------------------------------------------
+// mem -> mpz
+// ---------------------------------------------------------------------------
+static void mem_to_mpz(mpz_t z, const mem_t *m){
+    uint8_t buf[BITS/8];
+
+    for(int i = 0; i < LIMBS; i++){
+        uint32_t limb = m->_limbs[i];
+        buf[i*4+0] =  limb        & 0xFF;
+        buf[i*4+1] = (limb >>  8) & 0xFF;
+        buf[i*4+2] = (limb >> 16) & 0xFF;
+        buf[i*4+3] = (limb >> 24) & 0xFF;
+    }
+
+    mpz_import(z, BITS/8, -1, 1, -1, 0, buf);
 }
 
 
-// Phase 1: one CGBN instance per (task, bit_position) pair.
-// powers[task * EBITS + i] = base^(2^i) mod n
-__global__ void phase1_kernel(
-    Task  *tasks,
-    mem_t *powers,
-    int    n
-){
+// ---------------------------------------------------------------------------
+// Phase 1: one CGBN instance per (task, bit_position)
+// powers[task * ebits + i] = base^(2^i) mod n
+// ---------------------------------------------------------------------------
+__global__
+void phase1_kernel(Task *tasks, mem_t *powers, int n, int ebits){
     int instance = (blockIdx.x * blockDim.x + threadIdx.x) / TPI;
-    if(instance >= n * EBITS) return;
 
-    int task_id = instance / EBITS;
-    int bit_idx = instance % EBITS;
+    if(instance >= n * ebits) return;
+
+    int task = instance / ebits;
+    int bit  = instance % ebits;
 
     context_t ctx(cgbn_no_checks);
     env_t     env(ctx);
@@ -76,13 +105,11 @@ __global__ void phase1_kernel(
     env_t::cgbn_t      base, mod, result;
     env_t::cgbn_wide_t wide;
 
-    cgbn_load(env, base, &tasks[task_id].base);
-    cgbn_load(env, mod,  &tasks[task_id].mod);
-
-    // base^(2^bit_idx) = square base bit_idx times
+    cgbn_load(env, base, &tasks[task].base);
+    cgbn_load(env, mod,  &tasks[task].mod);
     cgbn_set(env, result, base);
 
-    for(int s = 0; s < bit_idx; s++){
+    for(int i = 0; i < bit; i++){
         cgbn_mul_wide(env, wide, result, result);
         cgbn_rem_wide(env, result, wide, mod);
     }
@@ -91,182 +118,318 @@ __global__ void phase1_kernel(
 }
 
 
-// Phase 2: one CGBN instance per task.
-// Accumulate product of powers[i] where bit i of exp is set.
-__global__ void phase2_kernel(
-    Task  *tasks,
-    mem_t *powers,
-    mem_t *results,
-    int    n
-){
+// ---------------------------------------------------------------------------
+// Phase 2: one CGBN instance per task
+// multiply selected powers where bit i of exp is set
+// ---------------------------------------------------------------------------
+__global__
+void phase2_kernel(Task *tasks, mem_t *powers, mem_t *results, int n, int ebits){
     int instance = (blockIdx.x * blockDim.x + threadIdx.x) / TPI;
+
     if(instance >= n) return;
 
     context_t ctx(cgbn_no_checks);
     env_t     env(ctx);
 
-    env_t::cgbn_t      exp, mod, acc, power;
+    env_t::cgbn_t      exp, mod, acc, power, old_acc;
     env_t::cgbn_wide_t wide;
 
     cgbn_load(env, exp, &tasks[instance].exp);
     cgbn_load(env, mod, &tasks[instance].mod);
     cgbn_set_ui32(env, acc, 1);
 
-    for(int i = 0; i < EBITS; i++){
-        // all 32 threads in this instance read the same exp,
-        // so no warp divergence here
+    for(int i = 0; i < ebits; i++){
         uint32_t bit = cgbn_extract_bits_ui32(env, exp, i, 1);
-        if(bit){
-            cgbn_load(env, power, &powers[instance * EBITS + i]);
-            cgbn_mul_wide(env, wide, acc, power);
-            cgbn_rem_wide(env, acc, wide, mod);
-        }
+
+        cgbn_set(env, old_acc, acc);
+
+        cgbn_load(env, power, &powers[instance * ebits + i]);
+        cgbn_mul_wide(env, wide, acc, power);
+        cgbn_rem_wide(env, acc, wide, mod);
+
+        if(bit == 0)
+            cgbn_set(env, acc, old_acc);
     }
 
     cgbn_store(env, &results[instance], acc);
 }
 
 
-int main(){
+int main(int argc, char *argv[]){
 
-    // sanity: 3^11 mod 17 = 7
+    // -----------------------------------------------------------------------
+    // Sanity check: 3^11 mod 17 = 7  (uses fixed ebits=4 for sanity only)
+    // -----------------------------------------------------------------------
     {
-        Task  h;
-        store64(&h.base, 3);
-        store64(&h.exp,  11);
-        store64(&h.mod,  17);
+        mpz_t b, e, m, r;
+        mpz_inits(b, e, m, r, NULL);
+        mpz_set_ui(b, 3);
+        mpz_set_ui(e, 11);
+        mpz_set_ui(m, 17);
+
+        Task h;
+        mpz_to_mem(&h.base, b);
+        mpz_to_mem(&h.exp,  e);
+        mpz_to_mem(&h.mod,  m);
+
+        int sanity_ebits = 4;  // 11 = 1011b, needs 4 bits
 
         Task  *d_task;
         mem_t *d_powers, *d_result;
         mem_t  result;
 
         CUDA_CHECK(cudaMalloc(&d_task,   sizeof(Task)));
-        CUDA_CHECK(cudaMalloc(&d_powers, EBITS * sizeof(mem_t)));
+        CUDA_CHECK(cudaMalloc(&d_powers, sanity_ebits * sizeof(mem_t)));
         CUDA_CHECK(cudaMalloc(&d_result, sizeof(mem_t)));
         CUDA_CHECK(cudaMemcpy(d_task, &h, sizeof(Task), cudaMemcpyHostToDevice));
 
-        phase1_kernel<<<(EBITS * TPI + TPB - 1) / TPB, TPB>>>(d_task, d_powers, 1);
+        int p1 = (sanity_ebits * TPI + TPB - 1) / TPB;
+        phase1_kernel<<<p1, TPB>>>(d_task, d_powers, 1, sanity_ebits);
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        phase2_kernel<<<1, TPB>>>(d_task, d_powers, d_result, 1);
+        phase2_kernel<<<1, TPB>>>(d_task, d_powers, d_result, 1, sanity_ebits);
         CUDA_CHECK(cudaDeviceSynchronize());
 
         CUDA_CHECK(cudaMemcpy(&result, d_result, sizeof(mem_t), cudaMemcpyDeviceToHost));
 
-        ull val = load64(&result);
-        printf("Sanity: 3^11 mod 17 = %llu (expected 7)\n", val);
-        if(val != 7){ printf("Kernel bug\n"); return 1; }
+        mem_to_mpz(r, &result);
+        unsigned long sanity = mpz_get_ui(r);
+        printf("Sanity: 3^11 mod 17 = %lu (expected 7)\n", sanity);
 
+        if(sanity != 7){
+            printf("Kernel bug\n");
+            return 1;
+        }
+
+        mpz_clears(b, e, m, r, NULL);
         cudaFree(d_task);
         cudaFree(d_powers);
         cudaFree(d_result);
     }
 
-
-    // open files
-    FILE *fin     = fopen("../data/dataset_64bit.txt",      "r");
-    FILE *seq     = fopen("../data/sequential_results.txt", "r");
-    FILE *out     = fopen("../data/bitpar_results.txt",     "w");
-    FILE *timelog = fopen("../data/runtime_results.txt",    "a");
-
-    if(!fin || !seq || !out || !timelog){
-        printf("File open failed\n");
+    // -----------------------------------------------------------------------
+    // Arguments
+    // -----------------------------------------------------------------------
+    if(argc < 2){
+        fprintf(stderr,
+            "Usage:\n"
+            "    %s input_file [output_file]\n\n"
+            "Example:\n"
+            "    %s ../data/dataset_1024bit.txt\n"
+            "    %s ../data/dataset_1024bit.txt ../data/out/bitpar_results.txt\n",
+            argv[0], argv[0], argv[0]);
         return 1;
     }
 
+    const char *inputFile  = argv[1];
+    const char *outputFile = (argc >= 3) ? argv[2]
+                                         : "../data/out/bitpar_results.txt";
 
-    // load tasks
-    char line[256];
-    int  count = 0;
-    Task hostInput[100000];
+    // -----------------------------------------------------------------------
+    // Open input file
+    // -----------------------------------------------------------------------
+    FILE *fin = fopen(inputFile, "r");
+    if(!fin){
+        perror("Error opening input file");
+        return 1;
+    }
+
+    // -----------------------------------------------------------------------
+    // Parse dataset into tasks
+    // -----------------------------------------------------------------------
+    std::vector<Task> h_tasks;
+    h_tasks.reserve(100000);
+
+    mpz_t base, exp, mod;
+    mpz_inits(base, exp, mod, NULL);
+
+    char line[4096];
+    int  skipped = 0;
 
     while(fgets(line, sizeof(line), fin)){
-        if(line[0] == '#' || line[0] == '\n') continue;
-        ull b, e, m;
-        if(sscanf(line, "%llu %llu %llu", &b, &e, &m) != 3) continue;
-        if(m == 0 || m % 2 == 0) continue;
-        store64(&hostInput[count].base, b);
-        store64(&hostInput[count].exp,  e);
-        store64(&hostInput[count].mod,  m);
-        count++;
+        if(line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
+        line[strcspn(line, "\r\n")] = '\0';
+
+        char *tok_b = strtok(line, " \t");
+        char *tok_e = strtok(NULL, " \t");
+        char *tok_m = strtok(NULL, " \t");
+
+        if(!tok_b || !tok_e || !tok_m){
+            fprintf(stderr, "Skipping malformed line (need 3 tokens)\n");
+            skipped++; continue;
+        }
+
+        if(mpz_set_str(base, tok_b, 0) != 0 ||
+           mpz_set_str(exp,  tok_e, 0) != 0 ||
+           mpz_set_str(mod,  tok_m, 0) != 0){
+            fprintf(stderr, "Skipping unparseable line\n");
+            skipped++; continue;
+        }
+
+        if(mpz_sgn(mod) == 0){
+            fprintf(stderr, "Skipping modulus=0\n");
+            skipped++; continue;
+        }
+
+        if(mpz_even_p(mod)){
+            fprintf(stderr, "Skipping even modulus\n");
+            skipped++; continue;
+        }
+
+        Task t;
+        mpz_to_mem(&t.base, base);
+        mpz_to_mem(&t.exp,  exp);
+        mpz_to_mem(&t.mod,  mod);
+        h_tasks.push_back(t);
     }
 
     fclose(fin);
-    printf("Loaded %d tasks\n", count);
+    mpz_clears(base, exp, mod, NULL);
 
+    int n = (int)h_tasks.size();
+    printf("Input file  : %s\n", inputFile);
+    printf("Output file : %s\n", outputFile);
+    printf("Processed   : %d cases (%d skipped)\n", n, skipped);
 
+    if(n == 0){ printf("No valid data\n"); return 1; }
+
+    // -----------------------------------------------------------------------
+    // Compute dynamic EBITS from actual exponent data
+    // -----------------------------------------------------------------------
+    int    max_ebits = 1;
+    mpz_t  tmp;
+    mpz_init(tmp);
+
+    for(auto &t : h_tasks){
+        mem_to_mpz(tmp, &t.exp);
+        int bits = (int)mpz_sizeinbase(tmp, 2);
+        if(bits > max_ebits) max_ebits = bits;
+    }
+
+    mpz_clear(tmp);
+
+    if(max_ebits > MAX_EBITS){
+        printf("Warning: clamping ebits %d -> %d\n", max_ebits, MAX_EBITS);
+        max_ebits = MAX_EBITS;
+    }
+
+    printf("Exponent bits: %d\n", max_ebits);
+
+    // -----------------------------------------------------------------------
     // GPU memory
+    // -----------------------------------------------------------------------
     Task  *d_tasks;
-    mem_t *d_powers, *d_results;
+    mem_t *d_pow;
+    mem_t *d_results;
 
-    CUDA_CHECK(cudaMalloc(&d_tasks,   count * sizeof(Task)));
-    CUDA_CHECK(cudaMalloc(&d_powers,  count * EBITS * sizeof(mem_t)));
-    CUDA_CHECK(cudaMalloc(&d_results, count * sizeof(mem_t)));
-    CUDA_CHECK(cudaMemcpy(d_tasks, hostInput, count * sizeof(Task), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMalloc(&d_tasks,   n * sizeof(Task)));
+    CUDA_CHECK(cudaMalloc(&d_pow,     (long long)n * max_ebits * sizeof(mem_t)));
+    CUDA_CHECK(cudaMalloc(&d_results, n * sizeof(mem_t)));
+    CUDA_CHECK(cudaMemcpy(d_tasks, h_tasks.data(),
+        n * sizeof(Task), cudaMemcpyHostToDevice));
 
-
-    // timing
+    // -----------------------------------------------------------------------
+    // Launch kernels
+    // -----------------------------------------------------------------------
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
     cudaEventRecord(start);
 
-
-    // Phase 1
-    int p1_instances = count * EBITS;
-    int p1_blocks    = (p1_instances * TPI + TPB - 1) / TPB;
-    phase1_kernel<<<p1_blocks, TPB>>>(d_tasks, d_powers, count);
+    // phase 1: n * max_ebits CGBN instances
+    int ph1_blocks = ((long long)n * max_ebits * TPI + TPB - 1) / TPB;
+    phase1_kernel<<<ph1_blocks, TPB>>>(d_tasks, d_pow, n, max_ebits);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // Phase 2
-    int p2_blocks = (count * TPI + TPB - 1) / TPB;
-    phase2_kernel<<<p2_blocks, TPB>>>(d_tasks, d_powers, d_results, count);
+    // phase 2: n CGBN instances
+    int ph2_blocks = (n * TPI + TPB - 1) / TPB;
+    phase2_kernel<<<ph2_blocks, TPB>>>(d_tasks, d_pow, d_results, n, max_ebits);
+    CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
-
 
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
 
     float gpu_ms;
     cudaEventElapsedTime(&gpu_ms, start, stop);
+    printf("Total time  : %.4f ms\n", gpu_ms);
 
+    // -----------------------------------------------------------------------
+    // GPU -> CPU
+    // -----------------------------------------------------------------------
+    std::vector<mem_t> h_results(n);
+    CUDA_CHECK(cudaMemcpy(h_results.data(), d_results,
+        n * sizeof(mem_t), cudaMemcpyDeviceToHost));
 
-    // copy back and verify
-    mem_t *gpuResults = (mem_t*)malloc(count * sizeof(mem_t));
-    CUDA_CHECK(cudaMemcpy(gpuResults, d_results, count * sizeof(mem_t), cudaMemcpyDeviceToHost));
+    // -----------------------------------------------------------------------
+    // Write output + verify against sequential results if present
+    // -----------------------------------------------------------------------
+    FILE *fout = fopen(outputFile, "w");
+    if(!fout){
+        perror("Error opening output file");
+        return 1;
+    }
 
-    int errors = 0;
+    FILE *seq = fopen("../data/out/sequential_results.txt", "r");
 
-    for(int i = 0; i < count; i++){
-        ull gpu_val = load64(&gpuResults[i]);
-        ull expected;
+    mpz_t gpu_val, expected;
+    mpz_inits(gpu_val, expected, NULL);
 
-        fprintf(out, "%llu\n", gpu_val);
+    int errors   = 0;
+    int verified = 0;
 
-        if(fscanf(seq, "%llu", &expected) != 1) break;
+    for(int i = 0; i < n; i++){
+        mem_to_mpz(gpu_val, &h_results[i]);
 
-        if(gpu_val != expected){
-            errors++;
-            printf("Mismatch case %d: got %llu expected %llu\n", i, gpu_val, expected);
+        char *res_str = mpz_get_str(NULL, 10, gpu_val);
+        fprintf(fout, "%s\n", res_str);
+        free(res_str);
+
+        if(seq){
+            if(mpz_inp_str(expected, seq, 10) == 0){
+                printf("Sequential file shorter than dataset — stopping verification at %d\n", i);
+                fclose(seq);
+                seq = NULL;
+            } else {
+                verified++;
+                if(mpz_cmp(gpu_val, expected) != 0){
+                    errors++;
+                    char *gs = mpz_get_str(NULL, 10, gpu_val);
+                    char *es = mpz_get_str(NULL, 10, expected);
+                    printf("Mismatch case %d:\n  GPU: %s\n  CPU: %s\n", i, gs, es);
+                    free(gs);
+                    free(es);
+                }
+            }
         }
     }
 
-    printf("\n%d/%d correct | GPU %.4f ms (phase1 + phase2)\n",
-        count - errors, count, gpu_ms);
+    if(verified > 0)
+        printf("%d/%d correct\n", verified - errors, verified);
+    else
+        printf("(No sequential_results.txt found — skipping verification)\n");
 
-    fprintf(timelog,
-        "bit_parallel | cases=%d | correct=%d/%d | gpu_ms=%.4f\n",
-        count, count - errors, count, gpu_ms);
+    // -----------------------------------------------------------------------
+    // Timelog
+    // -----------------------------------------------------------------------
+    FILE *timelog = fopen("../data/runtime/runtime_results.txt", "a");
+    if(timelog){
+        fprintf(timelog,
+            "bit_parallel | input=%s | cases=%d | ebits=%d | correct=%d/%d | gpu_ms=%.4f\n",
+            inputFile, n, max_ebits, verified - errors, verified, gpu_ms);
+        fclose(timelog);
+    }
 
+    // -----------------------------------------------------------------------
+    // Cleanup
+    // -----------------------------------------------------------------------
+    fclose(fout);
+    if(seq) fclose(seq);
 
-    // cleanup
-    fclose(seq);
-    fclose(out);
-    fclose(timelog);
+    mpz_clears(gpu_val, expected, NULL);
 
-    free(gpuResults);
     cudaFree(d_tasks);
-    cudaFree(d_powers);
+    cudaFree(d_pow);
     cudaFree(d_results);
     cudaEventDestroy(start);
     cudaEventDestroy(stop);

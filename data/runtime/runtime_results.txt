@@ -12,3 +12,9 @@ cgbn_batch | input=../data/in/dataset_32bit.txt | cases=1000000 | correct=100000
 cgbn_batch | input=../data/in/dataset_64bit.txt | cases=100000 | correct=100000/100000 | gpu_ms=198.5479
 cgbn_batch | input=../data/in/dataset_128bit.txt | cases=10000 | correct=10000/10000 | gpu_ms=42.4774
 cgbn_batch | input=../data/in/dataset_512bit.txt | cases=1000 | correct=1000/1000 | gpu_ms=18.1251
+bit_parallel | input=../data/in/dataset_64bit.txt | cases=100000 | correct=0/1000 | gpu_ms=1726.6294
+bit_parallel | input=../data/in/dataset_64bit.txt | cases=100000 | correct=100000/100000 | gpu_ms=1733.0302
+bit_parallel | input=../data/in/dataset_512bit.txt | cases=1000 | correct=0/1000 | gpu_ms=49.5026
+bit_parallel | input=../data/in/dataset_512bit.txt | cases=1000 | correct=0/1000 | gpu_ms=49.5980
+cgbn_batch | input=../data/in/dataset_512bit.txt | cases=1000 | correct=1000/1000 | gpu_ms=18.2037
+bit_parallel | input=../data/in/dataset_512bit.txt | cases=1000 | ebits=511 | correct=1000/1000 | gpu_ms=2485.1682

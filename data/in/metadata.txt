@@ -1,0 +1,9 @@
+# CS171 RSA Dataset
+# Seed: 67
+# Key sizes: [32, 64, 128, 512]
+32-bit: 1000000 cases in 230.0s
+64-bit: 100000 cases in 80.5s
+128-bit: 10000 cases in 19.3s
+512-bit: 1000 cases in 33.0s
+# Total cases: 1111000
+# Total time: 362.8s

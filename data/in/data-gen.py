@@ -26,15 +26,13 @@ random.seed(SEED)
 
 OUTPUT_DIR = "data"
 
-KEY_SIZES = [32, 64, 128, 512, 1024, 2048]
+KEY_SIZES = [32, 64, 128, 512]
 
 CASES_PER_SIZE = {
-    32: 0,
-    64: 0,
-    128: 0,
-    512: 0,
-    1024: 10000,
-    2048: 10000
+    32: 10000000,
+    64: 1000000,
+    128: 1000000,
+    512: 2
 }
 
 
@@ -192,7 +190,7 @@ def generate_dataset():
 
     for bits in KEY_SIZES:
         count = CASES_PER_SIZE[bits]
-        path = os.path.join(OUTPUT_DIR, f"dataset_{bits}bit.txt")
+        path = os.path.join(OUTPUT_DIR, f"dataset_{bits}bit_{count}cases.txt")
 
         print(f"\nGenerating {bits}-bit dataset ({count} cases)")
 

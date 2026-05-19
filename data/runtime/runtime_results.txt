@@ -8,3 +8,7 @@ bit_parallel_v2 | input=../data/in/dataset_1024bit.txt | cases=1 | correct=1/1 |
 bit_parallel_v2 | input=../data/in/dataset_1024bit.txt | cases=1 | correct=1/1 | k1_ms=16.9964 | total_ms=18.6730
 bit_parallel_v2 | input=../data/in/dataset_2048bit.txt | cases=1 | correct=0/1 | k1_ms=73.6184 | total_ms=83.2638
 bit_parallel_v2 | input=../data/in/dataset_2048bit.txt | cases=1 | correct=1/1 | k1_ms=73.6555 | total_ms=78.9992
+cgbn_batch | input=../data/in/dataset_32bit.txt | cases=1000000 | correct=1000000/1000000 | gpu_ms=841.0630
+cgbn_batch | input=../data/in/dataset_64bit.txt | cases=100000 | correct=100000/100000 | gpu_ms=198.5479
+cgbn_batch | input=../data/in/dataset_128bit.txt | cases=10000 | correct=10000/10000 | gpu_ms=42.4774
+cgbn_batch | input=../data/in/dataset_512bit.txt | cases=1000 | correct=1000/1000 | gpu_ms=18.1251

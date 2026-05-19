@@ -1,1 +1,10 @@
 cgbn_batch | input=../data/in/dataset_512bit.txt | cases=1000 | correct=1000/1000 | gpu_ms=18.1780
+bit_parallel | input=../data/in/dataset_512bit.txt | cases=1000 | correct=1000/1000 | phase1_ms=9184.6064 | phase2_ms=248.7626 | total_ms=9433.3691
+cgbn_batch | input=../data/in/dataset_1024bit.txt | cases=10 | correct=10/10 | gpu_ms=7.1352
+bit_parallel | input=../data/in/dataset_1024bit.txt | cases=10 | correct=10/10 | phase1_ms=117.5982 | phase2_ms=8.5836 | total_ms=126.1818
+cgbn_batch | input=../data/in/dataset_1024bit.txt | cases=1 | correct=1/1 | gpu_ms=6.9990
+bit_parallel | input=../data/in/dataset_1024bit.txt | cases=1 | correct=1/1 | phase1_ms=13.9868 | phase2_ms=1.0366 | total_ms=15.0234
+bit_parallel_v2 | input=../data/in/dataset_1024bit.txt | cases=1 | correct=1/1 | k1_ms=17.0015 | total_ms=18.5120
+bit_parallel_v2 | input=../data/in/dataset_1024bit.txt | cases=1 | correct=1/1 | k1_ms=16.9964 | total_ms=18.6730
+bit_parallel_v2 | input=../data/in/dataset_2048bit.txt | cases=1 | correct=0/1 | k1_ms=73.6184 | total_ms=83.2638
+bit_parallel_v2 | input=../data/in/dataset_2048bit.txt | cases=1 | correct=1/1 | k1_ms=73.6555 | total_ms=78.9992

@@ -1,0 +1,1 @@
+cgbn_batch | input=../data/in/dataset_512bit.txt | cases=1000 | correct=1000/1000 | gpu_ms=18.1780
